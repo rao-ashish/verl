@@ -38,7 +38,12 @@ from verl.utils.flops_counter import FlopsCounter
 from verl.utils.import_utils import import_external_libs
 from verl.utils.memory_utils import aggressive_empty_cache
 from verl.utils.metric.utils import Metric
-from verl.utils.profiler import DistProfiler, DistProfilerExtension, ProfilerConfig, log_gpu_memory_usage
+from verl.utils.profiler import (
+    DistProfiler,
+    DistProfilerExtension,
+    ProfilerConfig,
+    log_gpu_memory_usage,
+)
 from verl.utils.py_functional import append_to_dict
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
 from verl.utils.torch_functional import allgather_dict_into_dict
@@ -496,8 +501,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
     def init_model(self):
         model_config: HFModelConfig = omega_conf_to_dataclass(self.config.model)
 
+        log_gpu_memory_usage("init_model: start", logger=logger, level=logging.WARN)
+
         # 1. build reference model
         if "ref" in self.role:
+            log_gpu_memory_usage("init_model: before ref init", logger=logger, level=logging.WARN)
             # TODO: align ref config with actor config
             with open_dict(self.config.ref):
                 self.config.ref.ppo_mini_batch_size = self.config.actor.ppo_mini_batch_size
@@ -533,9 +541,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.ref = TrainingWorker(config=ref_training_config)
             self.ref.reset()
             self.set_dispatch_collect(mesh_name="ref", **self.ref.get_dispatch_collect())
+            log_gpu_memory_usage("init_model: after ref init", logger=logger, level=logging.WARN)
 
         # 2. build actor model
         if "actor" in self.role:
+            log_gpu_memory_usage("init_model: before actor init", logger=logger, level=logging.WARN)
             actor_config: ActorConfig = omega_conf_to_dataclass(self.config.actor)
             actor_config.model_config = model_config
             distillation_config: Optional[DistillationConfig] = (
@@ -584,9 +594,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.actor.reset()
             self.actor.set_loss_fn(self.loss_fn)
             self.set_dispatch_collect(mesh_name="actor", **self.actor.get_dispatch_collect())
+            log_gpu_memory_usage("init_model: after actor init", logger=logger, level=logging.WARN)
 
         # 3. build rollout engine
         if "rollout" in self.role:
+            log_gpu_memory_usage("init_model: before rollout init", logger=logger, level=logging.WARN)
             rollout_config: RolloutConfig = omega_conf_to_dataclass(self.config.rollout)
 
             # TODO: move rollout_device_mesh into ServerAdapter
@@ -612,9 +624,11 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.base_sync_done: bool = "dummy" not in self.config.rollout.load_format
             self.layered_summon = self.config.rollout.get("layered_summon", False)
             self.peft_merge: bool = model_config.lora.get("merge", False)
+            log_gpu_memory_usage("init_model: after rollout init", logger=logger, level=logging.WARN)
 
         # 4. build checkpoint engine
         if "actor" in self.role:
+            log_gpu_memory_usage("init_model: before checkpoint engine init", logger=logger, level=logging.WARN)
             checkpoint_engine_config = omega_conf_to_dataclass(self.config.rollout.checkpoint_engine)
             backend = checkpoint_engine_config.backend
             bucket_size = checkpoint_engine_config.update_weights_bucket_megabytes << 20
@@ -625,9 +639,27 @@ class ActorRolloutRefWorker(Worker, DistProfilerExtension):
             self.checkpoint_engine = CheckpointEngineRegistry.new(
                 backend, is_master=(torch.distributed.get_rank() == 0), bucket_size=bucket_size, **engine_kwargs
             )
+            log_gpu_memory_usage("init_model: after checkpoint engine init", logger=logger, level=logging.WARN)
 
         # Free cached GPU memory so colocated vLLM processes can see it via cudaMemGetInfo
         aggressive_empty_cache(force_sync=True)
+        log_gpu_memory_usage("init_model: end (after empty_cache)", logger=logger, level=logging.WARN)
+
+    @register(dispatch_mode=Dispatch.ONE_TO_ALL)
+    def log_gpu_memory_usage(self, head: str = "log_gpu_memory_usage", per_process: bool = True):
+        """Driver-callable RPC: log per-rank GPU memory via log_gpu_memory_usage.
+
+        Used by RayPPOTrainer to take memory snapshots from the trainer driver
+        around events that don't naturally run on the actor (e.g. before/after
+        checkpoint_manager.sleep_replicas() and _load_checkpoint()).
+
+        When ``per_process`` is True (default), also emits a per-PID NVML
+        breakdown of who is holding GPU bytes on this rank's device. This is
+        the most direct way to attribute residency that doesn't show up in
+        PyTorch's caching allocator (vLLM CuMemAllocator residual, NCCL
+        communicators, TE/cuBLAS workspaces, separate Ray actor CUDA contexts).
+        """
+        log_gpu_memory_usage(head, logger=logger, level=logging.WARN, per_process=per_process)
 
     @register(dispatch_mode=make_nd_compute_dataproto_dispatch_fn(mesh_name="ref"))
     @DistProfiler.annotate(color="olive", role="ref_compute_log_prob")

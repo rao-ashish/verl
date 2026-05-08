@@ -15,6 +15,7 @@
 import datetime
 import inspect
 import logging
+import os
 from contextlib import contextmanager
 from typing import Any, Optional
 
@@ -60,7 +61,16 @@ def _get_current_mem_info(unit: str = "GB", precision: int = 2) -> tuple[str]:
     return mem_allocated, mem_reserved, mem_used, mem_total
 
 
-def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging.DEBUG, rank: int = 0):
+def log_gpu_memory_usage(
+    head: str,
+    logger: logging.Logger = None,
+    level=logging.DEBUG,
+    rank: int = 0,
+    synchronize: bool = True,
+    per_process: bool = True,
+    unit: str = "GB",
+    precision: int = 2,
+):
     """Log GPU memory usage information.
 
     Args:
@@ -68,18 +78,167 @@ def log_gpu_memory_usage(head: str, logger: logging.Logger = None, level=logging
         logger (logging.Logger, optional): Logger instance to use for logging. If None, prints to stdout.
         level: Logging level to use. Defaults to logging.DEBUG.
         rank (int): The rank of the process to log memory for. Defaults to 0.
+        synchronize (bool): If True, drain pending GPU work via
+            ``torch.<device>.synchronize()`` before sampling memory. This makes
+            the reported numbers reflect a quiesced device rather than racing
+            with kernels still in flight (cudaMemGetInfo / memory_allocated
+            return whatever the allocator and driver currently see, which can
+            transiently undercount or overcount when work is queued). Defaults
+            to True; set False on hot paths where the extra sync is too costly.
+        per_process (bool): If True (default), also emit a per-PID NVML
+            breakdown of GPU residency on this rank's device. This is the most
+            direct way to attribute bytes that don't show up in PyTorch's
+            caching allocator (e.g. vLLM's CuMemAllocator sleep residual,
+            NCCL communicators, TE/cuBLAS workspaces, separate Ray actor CUDA
+            contexts). NVML attributes bytes to the *process* that called
+            ``cuMemAlloc``/``cuMemMap``, so when multiple Ray actors share a
+            physical GPU (WorkerDict + vLLMHttpServer + EngineCore + per-TP
+            Worker subprocesses) this breakdown tells you which process owns
+            the residual. Falls back gracefully to "unavailable" if NVML /
+            pynvml is not usable on this device.
+        unit (str): Unit for the per-process breakdown. "GB", "MB", or "KB".
+            Defaults to "GB". (The base allocator/device line is always
+            reported in GB to preserve historical formatting.)
+        precision (int): Decimal places for the per-process breakdown.
+            Defaults to 2.
     """
-    if (not dist.is_initialized()) or (rank is None) or (dist.get_rank() == rank):
-        mem_allocated, mem_reserved, mem_used, mem_total = _get_current_mem_info()
-        message = (
-            f"{head}, memory allocated (GB): {mem_allocated}, memory reserved (GB): {mem_reserved}, "
-            f"device memory used/total (GB): {mem_used}/{mem_total}"
-        )
+    if not ((not dist.is_initialized()) or (rank is None) or (dist.get_rank() == rank)):
+        return
 
-        if logger is None:
-            print(message)
+    if synchronize:
+        device = get_torch_device()
+        if device != torch.cpu and hasattr(device, "synchronize"):
+            device.synchronize()
+
+    mem_allocated, mem_reserved, mem_used, mem_total = _get_current_mem_info()
+    message = (
+        f"{head}, memory allocated (GB): {mem_allocated}, memory reserved (GB): {mem_reserved}, "
+        f"device memory used/total (GB): {mem_used}/{mem_total}"
+    )
+
+    if per_process:
+        rows, free_bytes, total_bytes = _get_per_process_mem_info(unit=unit, precision=precision)
+        if rows is None or free_bytes is None or total_bytes is None:
+            per_process_message = (
+                f"{head} (per-process GPU memory): unavailable (NVML/pynvml not usable on this device)"
+            )
         else:
-            logger.log(msg=message, level=level)
+            divisor = 1024**3 if unit == "GB" else 1024**2 if unit == "MB" else 1024
+            used_bytes = total_bytes - free_bytes
+            header = (
+                f"{head} (per-process GPU memory, {unit}): "
+                f"device used/total: {used_bytes / divisor:.{precision}f}/{total_bytes / divisor:.{precision}f}, "
+                f"n_procs: {len(rows)}"
+            )
+            if not rows:
+                per_process_message = header + " [no compute processes reported by NVML]"
+            else:
+                self_pid = os.getpid()
+                lines = [header]
+                for pid, _used_bytes, used_str, name in rows:
+                    marker = " <-- self" if pid == self_pid else ""
+                    lines.append(f"  pid={pid:<7} mem={used_str:>8} {unit} name={name}{marker}")
+                per_process_message = "\n".join(lines)
+        message = message + "\n" + per_process_message
+
+    if logger is None:
+        print(message)
+    else:
+        logger.log(msg=message, level=level)
+
+
+def _get_process_name(pid: int) -> str:
+    """Best-effort lookup of a human-readable name for a PID.
+
+    Reads /proc/<pid>/comm (the kernel-set short name, e.g. "ray::WorkerDict"
+    when Ray sets the process title) and falls back to the first token of
+    /proc/<pid>/cmdline. Returns "?" if neither is readable. Never raises.
+    """
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
+        if comm:
+            return comm
+    except OSError:
+        pass
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            raw = f.read().split(b"\x00")
+        if raw and raw[0]:
+            return os.path.basename(raw[0].decode(errors="replace"))
+    except OSError:
+        pass
+    return "?"
+
+
+def _get_per_process_mem_info(unit: str = "GB", precision: int = 2):
+    """Per-process GPU memory usage on the current accelerator, via NVML.
+
+    Returns a list of ``(pid, used_bytes, used_str, name)`` tuples sorted by
+    descending memory, plus the device's free/total bytes. NVML reports the
+    same physical-GPU view that ``cudaMemGetInfo`` does, so summing
+    ``used_bytes`` across rows should approximately equal device "used" from
+    :func:`_get_current_mem_info` (modulo bookkeeping NVML doesn't attribute
+    to a PID, e.g. CUDA context overhead in some driver versions).
+
+    Returns ``(None, None, None)`` if NVML / pynvml is unavailable or this
+    is a non-CUDA device. Never raises.
+    """
+    assert unit in ["GB", "MB", "KB"]
+    device = get_torch_device()
+    if device == torch.cpu:
+        return None, None, None
+    try:
+        import pynvml
+    except ImportError:
+        return None, None, None
+
+    divisor = 1024**3 if unit == "GB" else 1024**2 if unit == "MB" else 1024
+    nvml_initialized = False
+    try:
+        pynvml.nvmlInit()
+        nvml_initialized = True
+        try:
+            device_idx = int(get_device_id())
+        except Exception:
+            device_idx = 0
+        handle = pynvml.nvmlDeviceGetHandleByIndex(device_idx)
+        mem_info = pynvml.nvmlDeviceGetMemoryInfo(handle)
+        # Try v3 first (richer info on newer drivers); fall back to the
+        # version-agnostic API. Both return objects with .pid and .usedGpuMemory.
+        try:
+            procs = pynvml.nvmlDeviceGetComputeRunningProcesses_v3(handle)
+        except (AttributeError, pynvml.NVMLError):
+            try:
+                procs = pynvml.nvmlDeviceGetComputeRunningProcesses(handle)
+            except pynvml.NVMLError:
+                procs = []
+        rows = []
+        for p in procs:
+            used = getattr(p, "usedGpuMemory", None)
+            # NVML returns a sentinel (often 2**64-1) when the driver can't
+            # attribute memory to the PID (e.g. MIG without per-process
+            # accounting). Skip those rather than reporting 16 EiB.
+            if used is None or used >= (1 << 63):
+                used = 0
+            rows.append(
+                (
+                    int(p.pid),
+                    int(used),
+                    f"{int(used) / divisor:.{precision}f}",
+                    _get_process_name(int(p.pid)),
+                )
+            )
+        rows.sort(key=lambda r: r[1], reverse=True)
+        return rows, int(mem_info.free), int(mem_info.total)
+    except Exception:
+        return None, None, None
+    finally:
+        if nvml_initialized:
+            try:
+                pynvml.nvmlShutdown()
+            except Exception:
+                pass
 
 
 class GPUMemoryLogger(DecoratorLoggerBase):

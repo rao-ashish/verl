@@ -559,7 +559,9 @@ class RayPPOTrainer:
             if self.use_rm and "rm_scores" not in test_output_gen_batch_padded.batch.keys():
                 # for colocate reward models, we need to sleep rollout model
                 # to spare GPU memory for reward model
+                self.actor_rollout_wg.log_gpu_memory_usage(head="validate: before sleep_replicas")
                 self.checkpoint_manager.sleep_replicas()
+                self.actor_rollout_wg.log_gpu_memory_usage(head="validate: after sleep_replicas")
                 batch_reward = self._compute_reward_colocate(test_output_gen_batch_padded)
                 test_output_gen_batch_padded = test_output_gen_batch_padded.union(batch_reward)
                 # wake up rollout model
@@ -856,6 +858,10 @@ class RayPPOTrainer:
         # To stream teacher computation with actor rollout, we instead pass the full manager so that the
         # teacher loop workers can sleep/wake together with rollout workers
         reward_loop_worker_handles = self.reward_loop_manager.reward_loop_workers if enable_agent_reward_loop else None
+        # Snapshot per-rank GPU memory before/after AgentLoopManager.create. The
+        # async_rollout_manager spawns vLLMHttpServer Ray actors that bring up
+        # vLLM engines and KV caches on the same GPUs as the WorkerDict actors.
+        self.actor_rollout_wg.log_gpu_memory_usage(head="init_workers: before AgentLoopManager.create")
         self.async_rollout_manager = AgentLoopManager.create(
             config=self.config,
             worker_group=self.actor_rollout_wg,
@@ -863,6 +869,7 @@ class RayPPOTrainer:
             reward_loop_worker_handles=reward_loop_worker_handles,
             teacher_model_manager=self.teacher_model_manager,
         )
+        self.actor_rollout_wg.log_gpu_memory_usage(head="init_workers: after AgentLoopManager.create")
 
         checkpoint_engine_config = omega_conf_to_dataclass(self.config.actor_rollout_ref.rollout.checkpoint_engine)
         # Support custom CheckpointEngineManager via config
@@ -878,7 +885,9 @@ class RayPPOTrainer:
         )
 
         # sleep all replicas to load checkpoint
+        self.actor_rollout_wg.log_gpu_memory_usage(head="init_workers: before sleep_replicas")
         self.checkpoint_manager.sleep_replicas()
+        self.actor_rollout_wg.log_gpu_memory_usage(head="init_workers: after sleep_replicas")
 
     def _save_checkpoint(self):
         from verl.utils.fs import local_mkdir_safe
@@ -1289,8 +1298,12 @@ class RayPPOTrainer:
         self.global_steps = 0
 
         # load checkpoint and update weights before doing anything
+        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: before _load_checkpoint")
         self._load_checkpoint()
+        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: after _load_checkpoint")
+        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: before initial update_weights")
         self.checkpoint_manager.update_weights(self.global_steps)
+        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: after initial update_weights")
 
         current_epoch = self.global_steps // len(self.train_dataloader)
 
@@ -1360,7 +1373,9 @@ class RayPPOTrainer:
                         if curr_step_profile:
                             self.async_rollout_manager.start_profile()
                         gen_batch_output = self.async_rollout_manager.generate_sequences(gen_batch_output)
+                        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: before sleep_replicas (gen)")
                         self.checkpoint_manager.sleep_replicas()
+                        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: after sleep_replicas (gen)")
                         if curr_step_profile:
                             self.async_rollout_manager.stop_profile()
 
@@ -1374,7 +1389,9 @@ class RayPPOTrainer:
                             if curr_step_profile:
                                 self.async_rollout_manager.start_profile()
                             gen_baseline_output = self.async_rollout_manager.generate_sequences(gen_baseline_batch)
+                            self.actor_rollout_wg.log_gpu_memory_usage(head="fit: before sleep_replicas (gen_max)")
                             self.checkpoint_manager.sleep_replicas()
+                            self.actor_rollout_wg.log_gpu_memory_usage(head="fit: after sleep_replicas (gen_max)")
                             if curr_step_profile:
                                 self.async_rollout_manager.stop_profile()
                             batch = batch.union(gen_baseline_output)
@@ -1573,8 +1590,10 @@ class RayPPOTrainer:
                                 self._save_checkpoint()
 
                         # update weights from trainer to rollout
+                        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: before update_weights")
                         with marked_timer("update_weights", timing_raw, color="red"):
                             self.checkpoint_manager.update_weights(self.global_steps)
+                        self.actor_rollout_wg.log_gpu_memory_usage(head="fit: after update_weights")
 
                         actor_output_metrics = reduce_metrics(actor_output.meta_info["metrics"])
                         metrics.update(actor_output_metrics)

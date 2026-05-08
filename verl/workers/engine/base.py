@@ -15,6 +15,8 @@
 The abstract base class defining the interface for model training engines.
 """
 
+import logging
+import os
 from abc import abstractmethod
 from contextlib import nullcontext
 from typing import Any, Callable, ContextManager, Generator, Optional
@@ -23,7 +25,11 @@ import torch
 from tensordict import TensorDict
 
 from verl.utils.device import get_device_name
+from verl.utils.profiler.performance import log_gpu_memory_usage
 from verl.utils.tensordict_utils import maybe_fix_3d_position_ids
+
+logger = logging.getLogger(__file__)
+logger.setLevel(os.getenv("VERL_LOGGING_LEVEL", "WARN"))
 
 
 class BaseEngine:
@@ -245,6 +251,16 @@ class BaseEngineCtx:
         if device != "cpu":
             if not self.engine.is_param_offload_enabled and not self.engine.is_optimizer_offload_enabled:
                 return
+
+        # Surface paging boundaries: emit before/after GPU memory snapshots
+        # around engine.to(...). This is the chokepoint for ref / actor (old
+        # log-prob, eval mode) / actor (update, train mode) param + optimizer
+        # paging, so logging here gives one before/after pair per RPC instead
+        # of having to add the same logging at every call site.
+        engine_label = type(self.engine).__name__
+        tag_before = f"BaseEngineCtx[{engine_label} mode={self.mode}]: before engine.to({device})"
+        tag_after = f"BaseEngineCtx[{engine_label} mode={self.mode}]: after engine.to({device})"
+        log_gpu_memory_usage(tag_before, logger=logger, level=logging.WARN)
         if self.mode == "eval":
             self.engine.to(device=device, model=self.engine.is_param_offload_enabled, optimizer=False, grad=False)
         elif self.mode == "train":
@@ -254,6 +270,7 @@ class BaseEngineCtx:
                 optimizer=self.engine.is_optimizer_offload_enabled,
                 grad=self.engine.is_param_offload_enabled,
             )
+        log_gpu_memory_usage(tag_after, logger=logger, level=logging.WARN)
 
     def __enter__(self):
         self._context_switch(get_device_name())

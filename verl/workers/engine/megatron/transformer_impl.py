@@ -632,6 +632,7 @@ class MegatronEngine(BaseEngine):
             tu.assign_non_tensor(micro_batch, num_micro_batch=n_micro_batch)
 
         forward_backward_func = get_forward_backward_func()
+        log_gpu_memory_usage("Before forward_backward_func", logger=logger, level=logging.WARN)
 
         postprocess_micro_batch_func = partial(
             self.postprocess_micro_batch_func,
